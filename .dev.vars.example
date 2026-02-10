@@ -1,0 +1,8 @@
+# Local development environment variables template
+# Copy this file to .dev.vars and fill in actual values
+
+# Access token (required) - Used for client authentication
+ACCESS_TOKEN=your_secure_random_token_here
+
+# Traffic query URL (optional) - Used for traffic info injection
+# TRAFFIC_URL=https://api.example.com/traffic

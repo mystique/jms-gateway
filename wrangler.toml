@@ -1,0 +1,20 @@
+name = "jms-gateway"
+main = "_worker.js"
+compatibility_date = "2024-01-01"
+
+# KV namespace binding
+# Create before first deployment: wrangler kv:namespace create "YAML_STORAGE"
+[[kv_namespaces]]
+binding = "YAML_STORAGE"
+id = "your_kv_namespace_id_here"
+preview_id = "your_preview_kv_id_here"
+
+# Non-sensitive environment variables
+[vars]
+# Traffic API URL (non-sensitive, can be public)
+TRAFFIC_URL = ""
+
+# ⚠️ Security Notice:
+# ACCESS_TOKEN is sensitive - DO NOT commit it to this file!
+# Local dev: Create .dev.vars file (already in .gitignore)
+# Production: Use wrangler secret put ACCESS_TOKEN
