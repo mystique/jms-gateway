@@ -165,18 +165,66 @@ async function fetchTrafficInfo(trafficUrl) {
 }
 
 /**
+ * Decode Base64 to UTF-8 string (supports Chinese, emoji, etc.)
+ * @param {string} base64 - Base64 encoded string
+ * @returns {string} - Decoded UTF-8 string
+ */
+function base64Decode(base64) {
+  // Clean the base64 string: remove whitespace, newlines
+  const cleaned = base64.replace(/\s/g, '');
+
+  // Convert standard Base64 to URL-safe Base64 if needed
+  // Replace URL-safe chars back to standard
+  const normalized = cleaned.replace(/-/g, '+').replace(/_/g, '/');
+
+  // Add padding if missing
+  const padLength = (4 - (normalized.length % 4)) % 4;
+  const padded = normalized + '='.repeat(padLength);
+
+  // Use Uint8Array approach compatible with Cloudflare Workers
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const lookup = new Uint8Array(256);
+  for (let i = 0; i < chars.length; i++) {
+    lookup[chars.charCodeAt(i)] = i;
+  }
+
+  const len = padded.length;
+  const bytes = [];
+
+  for (let i = 0; i < len; i += 4) {
+    const encoded1 = lookup[padded.charCodeAt(i)];
+    const encoded2 = lookup[padded.charCodeAt(i + 1)];
+    const encoded3 = lookup[padded.charCodeAt(i + 2)];
+    const encoded4 = lookup[padded.charCodeAt(i + 3)];
+
+    bytes.push((encoded1 << 2) | (encoded2 >> 4));
+    if (padded.charAt(i + 2) !== '=') {
+      bytes.push(((encoded2 & 15) << 4) | (encoded3 >> 2));
+    }
+    if (padded.charAt(i + 3) !== '=') {
+      bytes.push(((encoded3 & 3) << 6) | encoded4);
+    }
+  }
+
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+/**
  * Build subscription-userinfo header value
  * @param {object} trafficInfo - Traffic information object
- * @returns {string} - Header value string
+ * @returns {string|null} - Header value string or null if no data
  */
 function buildTrafficHeader(trafficInfo) {
-  if (!trafficInfo) return '';
+  if (!trafficInfo) return null;
 
   const parts = [];
-  if (trafficInfo.upload > 0) parts.push(`upload=${trafficInfo.upload}`);
-  if (trafficInfo.download > 0) parts.push(`download=${trafficInfo.download}`);
-  if (trafficInfo.total > 0) parts.push(`total=${trafficInfo.total}`);
-  if (trafficInfo.expire > 0) parts.push(`expire=${trafficInfo.expire}`);
+
+  // Always include all fields for maximum compatibility
+  // All values in bytes, expire in seconds (Unix timestamp)
+  parts.push(`upload=${trafficInfo.upload || 0}`);
+  parts.push(`download=${trafficInfo.download || 0}`);
+  parts.push(`total=${trafficInfo.total || 0}`);
+  parts.push(`expire=${trafficInfo.expire || 0}`);
 
   return parts.join('; ');
 }
@@ -242,10 +290,10 @@ export default {
 
     // 5. Read YAML from KV and fetch traffic info
     try {
-      // Read YAML from KV storage
-      const yamlContent = await env.YAML_STORAGE.get('proxy_yaml');
+      // Read YAML from KV storage (Base64 encoded)
+      const encodedContent = await env.YAML_STORAGE.get('proxy_yaml');
 
-      if (!yamlContent) {
+      if (!encodedContent) {
         console.error('[KV] YAML content not found');
         return new Response(
           JSON.stringify({ error: 'YAML not found in KV' }),
@@ -256,18 +304,25 @@ export default {
         );
       }
 
+      // Decode Base64 content (supports Unicode)
+      const yamlContent = base64Decode(encodedContent);
+
       // Fetch traffic information
-      const trafficInfo = await fetchTrafficInfo(env.TRAFFIC_URL);
+      const trafficInfo = await fetchTrafficInfo(env.TRAFFIC_URL); // NOSONAR
       const trafficHeader = buildTrafficHeader(trafficInfo);
 
-      // 6. Return response
+      // 6. Build filename from environment variable or use default
+      const filename = env.DOWNLOAD_FILENAME || 'JMS';
+
+      // 7. Return response
       const response = new Response(yamlContent, {
         headers: {
-          'Content-Type': 'text/yaml; charset=utf-8',
-          'Content-Disposition': 'inline; filename="config.yaml"',
-          'subscription-userinfo': trafficHeader,
-          'Profile-Update-Interval': '24',
-          'Cache-Control': 'private, no-cache',
+          // Use octet-stream for better compatibility with mobile clients
+          'Content-Type': 'application/octet-stream; charset=utf-8',
+          'Content-Disposition': `attachment; filename=${filename}.yaml`,
+          ...(trafficHeader && { 'Subscription-Userinfo': trafficHeader }),
+          'profile-update-interval': '24',
+          'Cache-Control': 'no-store, no-cache, must-revalidate',
         },
       });
 
