@@ -9,6 +9,12 @@ const RATE_LIMIT = new Map();
 const RATE_LIMIT_WINDOW = 60000; // 1 minute in milliseconds
 const RATE_LIMIT_MAX = 30; // maximum requests allowed
 
+// Auth failure limiting: max 5 failures per IP per 15 minutes, ban for 30 minutes
+const AUTH_FAIL_LIMIT = new Map();
+const AUTH_FAIL_WINDOW = 15 * 60 * 1000; // 15 minutes in milliseconds
+const AUTH_FAIL_MAX = 5; // maximum auth failures allowed
+const AUTH_FAIL_BAN_DURATION = 30 * 60 * 1000; // 30 minutes ban
+
 /**
  * Check rate limit for an IP address
  * @param {string} ip - Client IP address
@@ -51,6 +57,62 @@ function cleanupRateLimit() {
       RATE_LIMIT.set(ip, recentRequests);
     }
   }
+}
+
+/**
+ * Check if IP is banned due to too many auth failures
+ * @param {string} ip - Client IP address
+ * @returns {boolean} - true if allowed, false if banned
+ */
+function checkAuthFailLimit(ip) {
+  const now = Date.now();
+  const record = AUTH_FAIL_LIMIT.get(ip);
+
+  if (!record) return true;
+
+  // Check if currently banned
+  if (record.bannedUntil && now < record.bannedUntil) {
+    return false;
+  }
+
+  // Ban expired, clean up
+  if (record.bannedUntil && now >= record.bannedUntil) {
+    AUTH_FAIL_LIMIT.delete(ip);
+  }
+
+  return true;
+}
+
+/**
+ * Record an authentication failure for an IP
+ * @param {string} ip - Client IP address
+ */
+function recordAuthFail(ip) {
+  const now = Date.now();
+  const record = AUTH_FAIL_LIMIT.get(ip) || { failures: [], bannedUntil: null };
+
+  // Clean up expired failures
+  const windowStart = now - AUTH_FAIL_WINDOW;
+  record.failures = record.failures.filter((t) => t > windowStart);
+
+  // Add new failure
+  record.failures.push(now);
+
+  // Check if should ban
+  if (record.failures.length >= AUTH_FAIL_MAX) {
+    record.bannedUntil = now + AUTH_FAIL_BAN_DURATION;
+    console.warn(`[AuthBan] IP ${ip} banned for ${AUTH_FAIL_BAN_DURATION / 60000} minutes due to too many auth failures`);
+  }
+
+  AUTH_FAIL_LIMIT.set(ip, record);
+}
+
+/**
+ * Clear auth failure records (called on successful auth)
+ * @param {string} ip - Client IP address
+ */
+function clearAuthFail(ip) {
+  AUTH_FAIL_LIMIT.delete(ip);
 }
 
 /**
@@ -258,7 +320,22 @@ export default {
       );
     }
 
-    // 2. Environment check
+    // 2. Auth failure limit check
+    if (!checkAuthFailLimit(clientIP)) {
+      console.warn(`[AuthLimit] IP ${clientIP} is banned due to too many auth failures`);
+      return new Response(
+        JSON.stringify({ error: 'Too Many Authentication Failures', retry_after: 1800 }),
+        {
+          status: 403,
+          headers: {
+            'Content-Type': 'application/json',
+            'Retry-After': '1800',
+          },
+        }
+      );
+    }
+
+    // 3. Environment check
     if (!env.ACCESS_TOKEN || !env.YAML_STORAGE) {
       console.error('[Config] Environment variables not configured');
       return new Response(
@@ -270,15 +347,19 @@ export default {
       );
     }
 
-    // 3. Token authentication
+    // 4. Token authentication
     const token = url.searchParams.get('token');
     if (!verifyToken(token, env.ACCESS_TOKEN)) {
       console.warn(`[Auth] IP ${clientIP} authentication failed`);
+      recordAuthFail(clientIP);
       return new Response(JSON.stringify({ error: 'Unauthorized' }), {
         status: 401,
         headers: { 'Content-Type': 'application/json' },
       });
     }
+
+    // Clear auth failures on successful authentication
+    clearAuthFail(clientIP);
 
     // 4. Only handle subscribe path
     if (url.pathname !== '/subscribe') {
