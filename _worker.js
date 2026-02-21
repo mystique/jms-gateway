@@ -272,6 +272,17 @@ function base64Decode(base64) {
 }
 
 /**
+ * Convert bytes from 1000-based to 1024-based representation,
+ * so that client software dividing by 1024^3 displays the correct 1000-based GB value.
+ * e.g., 500 GB (1000-based) → client shows "500G" instead of "465.66G"
+ * @param {number} bytes - Byte value in 1000-based units
+ * @returns {number} - Adjusted value for 1024-based display
+ */
+function convertTo1024Display(bytes) {
+  return Math.round(bytes * Math.pow(1024 / 1000, 3));
+}
+
+/**
  * Build subscription-userinfo header value
  * @param {object} trafficInfo - Traffic information object
  * @returns {string|null} - Header value string or null if no data
@@ -281,11 +292,12 @@ function buildTrafficHeader(trafficInfo) {
 
   const parts = [];
 
-  // Always include all fields for maximum compatibility
-  // All values in bytes, expire in seconds (Unix timestamp)
-  parts.push(`upload=${trafficInfo.upload || 0}`);
-  parts.push(`download=${trafficInfo.download || 0}`);
-  parts.push(`total=${trafficInfo.total || 0}`);
+  // Convert from 1000-based bytes to 1024-based representation so clients
+  // display the correct decimal GB/TB value instead of a smaller binary GiB value.
+  // expire is a Unix timestamp (seconds), not bytes — no conversion needed.
+  parts.push(`upload=${convertTo1024Display(trafficInfo.upload || 0)}`);
+  parts.push(`download=${convertTo1024Display(trafficInfo.download || 0)}`);
+  parts.push(`total=${convertTo1024Display(trafficInfo.total || 0)}`);
   parts.push(`expire=${trafficInfo.expire || 0}`);
 
   return parts.join('; ');
