@@ -4,7 +4,7 @@
  * Features: Token authentication, rate limiting, traffic info injection
  */
 
-// Rate limiting: max 30 requests per IP per minute
+// Rate limiting: max 30 requests per IP per minute (sliding window counter)
 const RATE_LIMIT = new Map();
 const RATE_LIMIT_WINDOW = 60000; // 1 minute in milliseconds
 const RATE_LIMIT_MAX = 30; // maximum requests allowed
@@ -17,46 +17,28 @@ const AUTH_FAIL_BAN_DURATION = 30 * 60 * 1000; // 30 minutes ban
 
 /**
  * Check rate limit for an IP address
+ * Uses sliding window counter for O(1) lookup instead of storing timestamps
  * @param {string} ip - Client IP address
  * @returns {boolean} - true if allowed, false if rate limited
  */
 function checkRateLimit(ip) {
   const now = Date.now();
-  const windowStart = now - RATE_LIMIT_WINDOW;
+  const record = RATE_LIMIT.get(ip);
 
-  const requests = RATE_LIMIT.get(ip) || [];
-  const recentRequests = requests.filter((t) => t > windowStart);
+  // No existing record or window expired - start new window
+  if (!record || now - record.windowStart >= RATE_LIMIT_WINDOW) {
+    RATE_LIMIT.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
 
-  if (recentRequests.length >= RATE_LIMIT_MAX) {
+  // Within window - check count
+  if (record.count >= RATE_LIMIT_MAX) {
     return false;
   }
 
-  recentRequests.push(now);
-  RATE_LIMIT.set(ip, recentRequests);
-
-  // Cleanup old data occasionally (1% chance)
-  if (recentRequests.length === 1 && Math.random() < 0.01) {
-    cleanupRateLimit();
-  }
-
+  // Increment counter
+  record.count++;
   return true;
-}
-
-/**
- * Clean up expired rate limit entries
- */
-function cleanupRateLimit() {
-  const now = Date.now();
-  const windowStart = now - RATE_LIMIT_WINDOW;
-
-  for (const [ip, requests] of RATE_LIMIT.entries()) {
-    const recentRequests = requests.filter((t) => t > windowStart);
-    if (recentRequests.length === 0) {
-      RATE_LIMIT.delete(ip);
-    } else {
-      RATE_LIMIT.set(ip, recentRequests);
-    }
-  }
 }
 
 /**
@@ -68,6 +50,7 @@ function checkAuthFailLimit(ip) {
   const now = Date.now();
   const record = AUTH_FAIL_LIMIT.get(ip);
 
+  // No record = not banned
   if (!record) return true;
 
   // Check if currently banned
@@ -75,33 +58,34 @@ function checkAuthFailLimit(ip) {
     return false;
   }
 
-  // Ban expired, clean up
-  if (record.bannedUntil && now >= record.bannedUntil) {
-    AUTH_FAIL_LIMIT.delete(ip);
-  }
-
+  // Ban expired or no longer banned - clean up
+  AUTH_FAIL_LIMIT.delete(ip);
   return true;
 }
 
 /**
  * Record an authentication failure for an IP
+ * Uses sliding window counter for O(1) lookup
  * @param {string} ip - Client IP address
  */
 function recordAuthFail(ip) {
   const now = Date.now();
-  const record = AUTH_FAIL_LIMIT.get(ip) || { failures: [], bannedUntil: null };
+  let record = AUTH_FAIL_LIMIT.get(ip);
 
-  // Clean up expired failures
-  const windowStart = now - AUTH_FAIL_WINDOW;
-  record.failures = record.failures.filter((t) => t > windowStart);
-
-  // Add new failure
-  record.failures.push(now);
+  // No existing record or window expired - start new window
+  if (!record || now - record.windowStart >= AUTH_FAIL_WINDOW) {
+    record = { count: 1, windowStart: now, bannedUntil: null };
+  } else {
+    // Within window - increment count
+    record.count++;
+  }
 
   // Check if should ban
-  if (record.failures.length >= AUTH_FAIL_MAX) {
+  if (record.count >= AUTH_FAIL_MAX) {
     record.bannedUntil = now + AUTH_FAIL_BAN_DURATION;
-    console.warn(`[AuthBan] IP ${ip} banned for ${AUTH_FAIL_BAN_DURATION / 60000} minutes due to too many auth failures`);
+    console.warn(
+      `[AuthBan] IP ${ip} banned for ${AUTH_FAIL_BAN_DURATION / 60000} minutes due to too many auth failures`,
+    );
   }
 
   AUTH_FAIL_LIMIT.set(ip, record);
@@ -150,8 +134,8 @@ async function fetchTrafficInfo(trafficUrl) {
   try {
     const response = await fetch(trafficUrl, {
       headers: {
-        'User-Agent': 'Clash-Verge/1.0',
-        Accept: 'application/json',
+        "User-Agent": "Clash-Verge/1.0",
+        Accept: "application/json",
       },
       cf: {
         // Cache for 30 seconds to avoid hammering the traffic API
@@ -185,7 +169,7 @@ async function fetchTrafficInfo(trafficUrl) {
         resetDay,
         0,
         0,
-        0
+        0,
       );
 
       if (currentDay >= resetDay) {
@@ -195,7 +179,7 @@ async function fetchTrafficInfo(trafficUrl) {
           resetDay,
           0,
           0,
-          0
+          0,
         );
       }
 
@@ -213,15 +197,13 @@ async function fetchTrafficInfo(trafficUrl) {
         upload: Number.parseInt(data.upload) || 0,
         download: Number.parseInt(data.download) || 0,
         total: Number.parseInt(data.total) || 0,
-        expire: data.expire
-          ? new Date(data.expire).getTime() / 1000
-          : 0,
+        expire: data.expire ? new Date(data.expire).getTime() / 1000 : 0,
       };
     }
 
     return null;
   } catch (e) {
-    console.error('[Traffic] Failed to fetch traffic info:', e.message);
+    console.error("[Traffic] Failed to fetch traffic info:", e.message);
     return null;
   }
 }
@@ -233,18 +215,19 @@ async function fetchTrafficInfo(trafficUrl) {
  */
 function base64Decode(base64) {
   // Clean the base64 string: remove whitespace, newlines
-  const cleaned = base64.replace(/\s/g, '');
+  const cleaned = base64.replace(/\s/g, "");
 
   // Convert standard Base64 to URL-safe Base64 if needed
   // Replace URL-safe chars back to standard
-  const normalized = cleaned.replace(/-/g, '+').replace(/_/g, '/');
+  const normalized = cleaned.replace(/-/g, "+").replace(/_/g, "/");
 
   // Add padding if missing
   const padLength = (4 - (normalized.length % 4)) % 4;
-  const padded = normalized + '='.repeat(padLength);
+  const padded = normalized + "=".repeat(padLength);
 
   // Use Uint8Array approach compatible with Cloudflare Workers
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const lookup = new Uint8Array(256);
   for (let i = 0; i < chars.length; i++) {
     lookup[chars.charCodeAt(i)] = i;
@@ -260,10 +243,10 @@ function base64Decode(base64) {
     const encoded4 = lookup[padded.charCodeAt(i + 3)];
 
     bytes.push((encoded1 << 2) | (encoded2 >> 4));
-    if (padded.charAt(i + 2) !== '=') {
+    if (padded.charAt(i + 2) !== "=") {
       bytes.push(((encoded2 & 15) << 4) | (encoded3 >> 2));
     }
-    if (padded.charAt(i + 3) !== '=') {
+    if (padded.charAt(i + 3) !== "=") {
       bytes.push(((encoded3 & 3) << 6) | encoded4);
     }
   }
@@ -300,7 +283,7 @@ function buildTrafficHeader(trafficInfo) {
   parts.push(`total=${convertTo1024Display(trafficInfo.total || 0)}`);
   parts.push(`expire=${trafficInfo.expire || 0}`);
 
-  return parts.join('; ');
+  return parts.join("; ");
 }
 
 /**
@@ -309,64 +292,66 @@ function buildTrafficHeader(trafficInfo) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const clientIP = request.headers.get('CF-Connecting-IP') || 'unknown';
-    const userAgent = request.headers.get('User-Agent') || 'unknown';
+    const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
+    const userAgent = request.headers.get("User-Agent") || "unknown";
 
     // Log access
     console.log(
-      `[Access] ${new Date().toISOString()} | ${clientIP} | ${request.method} ${url.pathname} | ${userAgent}`
+      `[Access] ${new Date().toISOString()} | ${clientIP} | ${request.method} ${url.pathname} | ${userAgent}`,
     );
 
     // 1. Rate limit check
     if (!checkRateLimit(clientIP)) {
       console.warn(`[RateLimit] IP ${clientIP} exceeded rate limit`);
       return new Response(
-        JSON.stringify({ error: 'Too Many Requests', retry_after: 60 }),
+        JSON.stringify({ error: "Too Many Requests", retry_after: 60 }),
         {
           status: 429,
           headers: {
-            'Content-Type': 'application/json',
-            'Retry-After': '60',
+            "Content-Type": "application/json",
+            "Retry-After": "60",
           },
-        }
+        },
       );
     }
 
     // 2. Auth failure limit check
     if (!checkAuthFailLimit(clientIP)) {
-      console.warn(`[AuthLimit] IP ${clientIP} is banned due to too many auth failures`);
+      console.warn(
+        `[AuthLimit] IP ${clientIP} is banned due to too many auth failures`,
+      );
       return new Response(
-        JSON.stringify({ error: 'Too Many Authentication Failures', retry_after: 1800 }),
+        JSON.stringify({
+          error: "Too Many Authentication Failures",
+          retry_after: 1800,
+        }),
         {
           status: 403,
           headers: {
-            'Content-Type': 'application/json',
-            'Retry-After': '1800',
+            "Content-Type": "application/json",
+            "Retry-After": "1800",
           },
-        }
+        },
       );
     }
 
     // 3. Environment check
     if (!env.ACCESS_TOKEN || !env.YAML_STORAGE) {
-      console.error('[Config] Environment variables not configured');
-      return new Response(
-        JSON.stringify({ error: 'Service Not Configured' }),
-        {
-          status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        }
-      );
+      console.error("[Config] Environment variables not configured");
+      return new Response(JSON.stringify({ error: "Service Not Configured" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
     }
 
     // 4. Token authentication
-    const token = url.searchParams.get('token');
+    const token = url.searchParams.get("token");
     if (!verifyToken(token, env.ACCESS_TOKEN)) {
       console.warn(`[Auth] IP ${clientIP} authentication failed`);
       recordAuthFail(clientIP);
-      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { "Content-Type": "application/json" },
       });
     }
 
@@ -374,27 +359,24 @@ export default {
     clearAuthFail(clientIP);
 
     // 4. Only handle subscribe path
-    if (url.pathname !== '/subscribe') {
-      return new Response(JSON.stringify({ error: 'Not Found' }), {
+    if (url.pathname !== "/subscribe") {
+      return new Response(JSON.stringify({ error: "Not Found" }), {
         status: 404,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { "Content-Type": "application/json" },
       });
     }
 
     // 5. Read YAML from KV and fetch traffic info
     try {
       // Read YAML from KV storage (Base64 encoded)
-      const encodedContent = await env.YAML_STORAGE.get('proxy_yaml');
+      const encodedContent = await env.YAML_STORAGE.get("proxy_yaml");
 
       if (!encodedContent) {
-        console.error('[KV] YAML content not found');
-        return new Response(
-          JSON.stringify({ error: 'YAML not found in KV' }),
-          {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' },
-          }
-        );
+        console.error("[KV] YAML content not found");
+        return new Response(JSON.stringify({ error: "YAML not found in KV" }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        });
       }
 
       // Decode Base64 content (supports Unicode)
@@ -405,33 +387,31 @@ export default {
       const trafficHeader = buildTrafficHeader(trafficInfo);
 
       // 6. Build filename from environment variable or use default
-      const filename = env.DOWNLOAD_FILENAME || 'JMS';
+      const filename = env.DOWNLOAD_FILENAME || "JMS";
 
       // 7. Return response
       const response = new Response(yamlContent, {
         headers: {
           // Use octet-stream for better compatibility with mobile clients
-          'Content-Type': 'application/octet-stream; charset=utf-8',
-          'Content-Disposition': `attachment; filename=${filename}.yaml`,
-          ...(trafficHeader && { 'Subscription-Userinfo': trafficHeader }),
-          'profile-update-interval': '24',
-          'Cache-Control': 'no-store, no-cache, must-revalidate',
+          "Content-Type": "application/octet-stream; charset=utf-8",
+          "Content-Disposition": `attachment; filename=${filename}.yaml`,
+          ...(trafficHeader && { "Subscription-Userinfo": trafficHeader }),
+          "profile-update-interval": "24",
+          "Cache-Control": "no-store, no-cache, must-revalidate",
         },
       });
 
-      console.log(
-        `[Success] ${clientIP} | Traffic: ${trafficHeader || 'N/A'}`
-      );
+      console.log(`[Success] ${clientIP} | Traffic: ${trafficHeader || "N/A"}`);
 
       return response;
     } catch (e) {
       console.error(`[Error] ${clientIP} | ${e.message}`);
       return new Response(
-        JSON.stringify({ error: 'Internal Server Error', message: e.message }),
+        JSON.stringify({ error: "Internal Server Error", message: e.message }),
         {
           status: 500,
-          headers: { 'Content-Type': 'application/json' },
-        }
+          headers: { "Content-Type": "application/json" },
+        },
       );
     }
   },
