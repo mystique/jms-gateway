@@ -4,41 +4,201 @@
  * Features: Token authentication, rate limiting, traffic info injection
  */
 
-// Rate limiting: max 30 requests per IP per minute (sliding window counter)
-const RATE_LIMIT = new Map();
-const RATE_LIMIT_WINDOW = 60000; // 1 minute in milliseconds
-const RATE_LIMIT_MAX = 30; // maximum requests allowed
+/**
+ * Unified Sliding Window Rate Limiter
+ * Uses improved sliding window with dual counters for better accuracy
+ * Includes automatic cleanup to prevent memory leaks
+ */
+class RateLimiter {
+  /**
+   * @param {number} windowMs - Window size in milliseconds
+   * @param {number} maxRequests - Max requests per window
+   */
+  constructor(windowMs, maxRequests) {
+    this.windowMs = windowMs;
+    this.maxRequests = maxRequests;
+    this.records = new Map();
+    this.lastCleanup = Date.now();
+    this.cleanupInterval = 5 * 60 * 1000; // Clean up every 5 minutes
+  }
+
+  /**
+   * Clean up expired records to prevent memory leaks
+   */
+  _cleanup() {
+    const now = Date.now();
+    if (now - this.lastCleanup < this.cleanupInterval) return;
+
+    this.lastCleanup = now;
+    let deleted = 0;
+
+    for (const [key, record] of this.records) {
+      // Check if record is completely expired and can be removed
+      const isExpired = record.bannedUntil
+        ? now >= record.bannedUntil && now - record.windowStart >= this.windowMs
+        : now - record.windowStart >= this.windowMs * 2;
+
+      if (isExpired) {
+        this.records.delete(key);
+        deleted++;
+      }
+    }
+
+    if (deleted > 0) {
+      console.log(`[RateLimiter] Cleaned up ${deleted} expired records`);
+    }
+  }
+
+  /**
+   * Calculate weighted count using sliding window with dual counters
+   * @param {object} record - The rate limit record
+   * @param {number} now - Current timestamp
+   * @returns {number} - Weighted request count
+   */
+  _getWeightedCount(record, now) {
+    const elapsed = now - record.windowStart;
+
+    // If within current window, use full count
+    if (elapsed < this.windowMs) {
+      // Calculate weighted count: previous window * (1 - elapsed/window) + current window
+      const prevWeight = Math.max(0, 1 - elapsed / this.windowMs);
+      return Math.floor(record.prevCount * prevWeight + record.currCount);
+    }
+
+    // Window has expired, reset counters
+    return 0;
+  }
+
+  /**
+   * Check and increment rate limit
+   * @param {string} key - Key to rate limit (e.g., IP address)
+   * @returns {boolean} - true if allowed, false if rate limited
+   */
+  checkAndIncrement(key) {
+    this._cleanup();
+
+    const now = Date.now();
+    let record = this.records.get(key);
+
+    // No existing record - create new one
+    if (!record) {
+      this.records.set(key, {
+        prevCount: 0,
+        currCount: 1,
+        windowStart: now,
+        bannedUntil: null,
+      });
+      return true;
+    }
+
+    // Check if currently banned
+    if (record.bannedUntil && now < record.bannedUntil) {
+      return false;
+    }
+
+    // Clear ban if expired
+    if (record.bannedUntil && now >= record.bannedUntil) {
+      record.bannedUntil = null;
+    }
+
+    const elapsed = now - record.windowStart;
+
+    // If window has expired, slide it
+    if (elapsed >= this.windowMs) {
+      // Calculate how many full windows have passed
+      const windowsToSlide = Math.floor(elapsed / this.windowMs);
+
+      if (windowsToSlide === 1) {
+        // One window passed: current becomes previous, reset current
+        record.prevCount = record.currCount;
+        record.currCount = 0;
+      } else {
+        // Multiple windows passed: both counters reset
+        record.prevCount = 0;
+        record.currCount = 0;
+      }
+
+      record.windowStart += windowsToSlide * this.windowMs;
+    }
+
+    // Check if under limit
+    const weightedCount = this._getWeightedCount(record, now);
+    if (weightedCount >= this.maxRequests) {
+      return false;
+    }
+
+    // Increment counter
+    record.currCount++;
+    this.records.set(key, record);
+    return true;
+  }
+
+  /**
+   * Get current record for a key
+   * @param {string} key - Key to look up
+   * @returns {object|null} - Record or null
+   */
+  getRecord(key) {
+    return this.records.get(key) || null;
+  }
+
+  /**
+   * Set a ban on a key
+   * @param {string} key - Key to ban
+   * @param {number} durationMs - Ban duration in milliseconds
+   */
+  ban(key, durationMs) {
+    const now = Date.now();
+    let record = this.records.get(key);
+
+    if (!record) {
+      record = {
+        prevCount: 0,
+        currCount: 0,
+        windowStart: now,
+        bannedUntil: null,
+      };
+    }
+
+    record.bannedUntil = now + durationMs;
+    this.records.set(key, record);
+  }
+
+  /**
+   * Check if key is banned
+   * @param {string} key - Key to check
+   * @returns {boolean} - true if banned
+   */
+  isBanned(key) {
+    const record = this.records.get(key);
+    if (!record) return false;
+    if (!record.bannedUntil) return false;
+    return Date.now() < record.bannedUntil;
+  }
+
+  /**
+   * Clear record for a key
+   * @param {string} key - Key to clear
+   */
+  clear(key) {
+    this.records.delete(key);
+  }
+}
+
+// Rate limiting: max 30 requests per IP per minute (improved sliding window)
+const RATE_LIMITER = new RateLimiter(60000, 30);
 
 // Auth failure limiting: max 5 failures per IP per 15 minutes, ban for 30 minutes
-const AUTH_FAIL_LIMIT = new Map();
-const AUTH_FAIL_WINDOW = 15 * 60 * 1000; // 15 minutes in milliseconds
-const AUTH_FAIL_MAX = 5; // maximum auth failures allowed
+const AUTH_FAIL_LIMITER = new RateLimiter(15 * 60 * 1000, 5);
 const AUTH_FAIL_BAN_DURATION = 30 * 60 * 1000; // 30 minutes ban
 
 /**
  * Check rate limit for an IP address
- * Uses sliding window counter for O(1) lookup instead of storing timestamps
  * @param {string} ip - Client IP address
  * @returns {boolean} - true if allowed, false if rate limited
  */
 function checkRateLimit(ip) {
-  const now = Date.now();
-  const record = RATE_LIMIT.get(ip);
-
-  // No existing record or window expired - start new window
-  if (!record || now - record.windowStart >= RATE_LIMIT_WINDOW) {
-    RATE_LIMIT.set(ip, { count: 1, windowStart: now });
-    return true;
-  }
-
-  // Within window - check count
-  if (record.count >= RATE_LIMIT_MAX) {
-    return false;
-  }
-
-  // Increment counter
-  record.count++;
-  return true;
+  return RATE_LIMITER.checkAndIncrement(ip);
 }
 
 /**
@@ -47,48 +207,30 @@ function checkRateLimit(ip) {
  * @returns {boolean} - true if allowed, false if banned
  */
 function checkAuthFailLimit(ip) {
-  const now = Date.now();
-  const record = AUTH_FAIL_LIMIT.get(ip);
-
-  // No record = not banned
-  if (!record) return true;
-
-  // Check if currently banned
-  if (record.bannedUntil && now < record.bannedUntil) {
-    return false;
-  }
-
-  // Ban expired or no longer banned - clean up
-  AUTH_FAIL_LIMIT.delete(ip);
-  return true;
+  return !AUTH_FAIL_LIMITER.isBanned(ip);
 }
 
 /**
  * Record an authentication failure for an IP
- * Uses sliding window counter for O(1) lookup
  * @param {string} ip - Client IP address
  */
 function recordAuthFail(ip) {
   const now = Date.now();
-  let record = AUTH_FAIL_LIMIT.get(ip);
 
-  // No existing record or window expired - start new window
-  if (!record || now - record.windowStart >= AUTH_FAIL_WINDOW) {
-    record = { count: 1, windowStart: now, bannedUntil: null };
-  } else {
-    // Within window - increment count
-    record.count++;
+  // Check and increment auth failure count
+  const allowed = AUTH_FAIL_LIMITER.checkAndIncrement(ip);
+
+  // If not allowed, it means we've hit the limit - set ban
+  if (!allowed) {
+    // Check if already banned to avoid duplicate warnings
+    const record = AUTH_FAIL_LIMITER.getRecord(ip);
+    if (!record || !record.bannedUntil || now >= record.bannedUntil) {
+      AUTH_FAIL_LIMITER.ban(ip, AUTH_FAIL_BAN_DURATION);
+      console.warn(
+        `[AuthBan] IP ${ip} banned for ${AUTH_FAIL_BAN_DURATION / 60000} minutes due to too many auth failures`,
+      );
+    }
   }
-
-  // Check if should ban
-  if (record.count >= AUTH_FAIL_MAX) {
-    record.bannedUntil = now + AUTH_FAIL_BAN_DURATION;
-    console.warn(
-      `[AuthBan] IP ${ip} banned for ${AUTH_FAIL_BAN_DURATION / 60000} minutes due to too many auth failures`,
-    );
-  }
-
-  AUTH_FAIL_LIMIT.set(ip, record);
 }
 
 /**
@@ -96,7 +238,7 @@ function recordAuthFail(ip) {
  * @param {string} ip - Client IP address
  */
 function clearAuthFail(ip) {
-  AUTH_FAIL_LIMIT.delete(ip);
+  AUTH_FAIL_LIMITER.clear(ip);
 }
 
 /**
